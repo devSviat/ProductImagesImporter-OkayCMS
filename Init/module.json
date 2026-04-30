@@ -1,0 +1,23 @@
+{
+  "Okay": "4.5.2",
+  "version": "1.0.0",
+  "moduleName": "ProductImagesImporter",
+  "vendor": {
+    "email": "devsviat@proton.me",
+    "site": "https://github.com/devSviat"
+  },
+  "modifications": {
+    "backend": [
+      {
+        "file": "import.tpl",
+        "changes": [
+          {
+            "find": "<div class=\"heading_page\">",
+            "parent": true,
+            "html": "import_page_header_col_inner.tpl"
+          }
+        ]
+      }
+    ]
+  }
+}
