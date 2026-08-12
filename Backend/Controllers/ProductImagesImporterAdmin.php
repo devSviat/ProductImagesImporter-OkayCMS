@@ -74,10 +74,18 @@ class ProductImagesImporterAdmin extends IndexAdmin
                     'processed' => 0,
                 ]);
             } else {
-                // Як у стандартному імпорті товарів: перед новим імпортом очищуємо журнал.
-                $queryFactory->newSqlQuery()
-                    ->setStatement('TRUNCATE __sviat_product_images_import_log')
-                    ->execute();
+                // Велика вибірка приходить пачками, кожна окремим запитом. Ключ першої
+                // пачки повертається клієнту й далі їде з рештою — журнал чистимо тільки
+                // на першій, інакше кожна наступна стирала б попередні.
+                $importKeyRaw = $request->post('import_key', 'string');
+                $importKey = ProductImagesImportHelper::isValidImportKey($importKeyRaw) ? $importKeyRaw : null;
+
+                if ($importKey === null) {
+                    // Як у стандартному імпорті товарів: перед новим імпортом очищуємо журнал.
+                    $queryFactory->newSqlQuery()
+                        ->setStatement('TRUNCATE __sviat_product_images_import_log')
+                        ->execute();
+                }
 
                 $result = $importHelper->processUploadedFiles(
                     $files,
@@ -85,8 +93,19 @@ class ProductImagesImporterAdmin extends IndexAdmin
                     null,
                     $filenameKeyRulesForUpload,
                     $existingFilesPolicy,
-                    $missingProductPolicy
+                    $missingProductPolicy,
+                    $importKey
                 );
+
+                // PHP мовчки відкидає файли понад max_file_uploads: помилки в $_FILES нема,
+                // модуль просто не бачить решти. Єдиний доступний сигнал — упертися в ліміт.
+                $maxFileUploads = (int) ini_get('max_file_uploads');
+                if ($maxFileUploads > 0 && count($files) >= $maxFileUploads) {
+                    $result['warnings'][] = sprintf(
+                        $backendTranslations->getTranslation('sviat__product_images_importer__max_file_uploads_warning'),
+                        $maxFileUploads
+                    );
+                }
 
                 if ($request->post('ajax', 'boolean')) {
                     $response->setContent(json_encode([

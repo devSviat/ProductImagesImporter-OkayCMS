@@ -44,6 +44,7 @@ $lang['sviat__product_images_importer__files_formats'] = 'JPG, PNG, GIF, WebP а
 $lang['sviat__product_images_importer__files_choose'] = 'Виберіть файли…';
 $lang['sviat__product_images_importer__files_attached_count'] = 'Прикріплено файлів:';
 $lang['sviat__product_images_importer__files_required_error'] = 'Оберіть хоча б один файл для імпорту.';
+$lang['sviat__product_images_importer__max_file_uploads_warning'] = 'Сервер прийняв рівно %d файлів — це ліміт max_file_uploads у PHP. Решту вибірки він міг відкинути мовчки: перевірте, чи всі файли є у журналі.';
 $lang['sviat__product_images_importer__missing_product_policy_heading'] = 'Якщо товар не знайдено';
 $lang['sviat__product_images_importer__missing_product_policy_hint'] = 'Працює тільки для режимів «Кожен файл — за SKU» та «Кожен файл — за ID товару».';
 $lang['sviat__product_images_importer__missing_product_policy_save'] = 'Зберегти файл на сервері';
