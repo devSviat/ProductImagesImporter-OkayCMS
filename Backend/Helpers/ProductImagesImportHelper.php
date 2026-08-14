@@ -51,6 +51,20 @@ class ProductImagesImportHelper
         $this->importLogEntity = $entityFactory->get(ProductImagesImportLogEntity::class);
     }
 
+    /**
+     * Аплоад великої вибірки йде пачками (див. JS імпортера), і кожна пачка — окремий
+     * запит. Спільний import_key склеює їх в один імпорт у журналі.
+     */
+    public static function generateImportKey(): string
+    {
+        return date('YmdHis') . '_' . bin2hex(random_bytes(4));
+    }
+
+    public static function isValidImportKey(?string $key): bool
+    {
+        return $key !== null && preg_match('/^\d{14}_[0-9a-f]{8}$/', $key) === 1;
+    }
+
     public static function isValidAttachMode(string $mode): bool
     {
         return in_array($mode, [
@@ -149,7 +163,11 @@ class ProductImagesImportHelper
                 if (!isset($enabled[$ruleId])) {
                     continue;
                 }
-                $s = self::applyFilenameKeyRule($s, $ruleId);
+                // Обрізаємо хвіст після кожного правила, а не лише в кінці:
+                // paren_num зрізає "(3)" і лишає пробіл, а решта правил
+                // прив'язані до кінця рядка ($), тож без цього вони переставали
+                // спрацьовувати й "ABC_1-2 (3)" зупинявся на "ABC_1-2".
+                $s = rtrim(self::applyFilenameKeyRule($s, $ruleId));
             }
             if ($s === $before) {
                 break;
@@ -157,6 +175,71 @@ class ProductImagesImportHelper
         }
 
         return trim($s);
+    }
+
+    /**
+     * Усі ключі, за якими має сенс шукати товар, від найдовшого до найкоротшого.
+     *
+     * normalizeFilenameBase() зрізає суфікси до нерухомої точки, і це руйнує SKU,
+     * у якому дефіс із цифрами — частина самого артикулу: `SS-203758-1` ставав `SS`,
+     * тож ані друге фото, ані навіть перше не знаходили товар. Тут же кожен проміжний
+     * стан лишається кандидатом, а вибір робить БД — виграє перший, що реально існує.
+     *
+     * @param string   $baseName назва файлу без розширення
+     * @param string[] $ruleIds  результат sanitizeFilenameKeyRules()
+     *
+     * @return string[] унікальні непорожні ключі; перший — саме ім'я файлу
+     */
+    public static function filenameKeyCandidates(string $baseName, array $ruleIds): array
+    {
+        $s = trim($baseName);
+        if ($s === '') {
+            return [];
+        }
+
+        // Ключі масиву — щоб дешево відсіювати дублі. Числові SKU (`480132102047`)
+        // PHP приводить до int, тож на виході повертаємо їх назад у рядки.
+        $candidates = [$s => true];
+        if ($ruleIds === []) {
+            return self::candidateKeysToStrings($candidates);
+        }
+
+        $enabled = array_flip($ruleIds);
+        $order = self::filenameKeyRuleOrder();
+        $maxPasses = 16;
+
+        for ($pass = 0; $pass < $maxPasses; $pass++) {
+            $before = $s;
+            foreach ($order as $ruleId) {
+                if (!isset($enabled[$ruleId])) {
+                    continue;
+                }
+                $next = rtrim(self::applyFilenameKeyRule($s, $ruleId));
+                if ($next === $s) {
+                    continue;
+                }
+                $s = $next;
+                $trimmed = trim($s);
+                if ($trimmed !== '') {
+                    $candidates[$trimmed] = true;
+                }
+            }
+            if ($s === $before) {
+                break;
+            }
+        }
+
+        return self::candidateKeysToStrings($candidates);
+    }
+
+    /**
+     * @param array<array-key, true> $candidates
+     *
+     * @return string[]
+     */
+    private static function candidateKeysToStrings(array $candidates): array
+    {
+        return array_map('strval', array_keys($candidates));
     }
 
     private static function applyFilenameKeyRule(string $s, string $ruleId): string
@@ -187,6 +270,7 @@ class ProductImagesImportHelper
      * @param string[]    $filenameKeyRules     для ATTACH_FILENAME_*: правила нормалізації
      * @param string      $existingFilesPolicy  одна з EXISTING_FILES_*
      * @param string      $missingProductPolicy одна з ON_MISSING_PRODUCT_*
+     * @param string|null $importKey            ключ уже початого імпорту (наступна пачка файлів)
      */
     public function processUploadedFiles(
         array $files,
@@ -194,7 +278,8 @@ class ProductImagesImportHelper
         ?string $globalProductId = null,
         array $filenameKeyRules = [],
         string $existingFilesPolicy = self::EXISTING_FILES_SKIP,
-        string $missingProductPolicy = self::ON_MISSING_PRODUCT_SKIP
+        string $missingProductPolicy = self::ON_MISSING_PRODUCT_SKIP,
+        ?string $importKey = null
     ): array {
         $result = [
             'success' => [],
@@ -202,7 +287,7 @@ class ProductImagesImportHelper
             'warnings' => [],
             'total' => 0,
             'processed' => 0,
-            'import_key' => date('YmdHis') . '_' . bin2hex(random_bytes(4)),
+            'import_key' => self::isValidImportKey($importKey) ? $importKey : self::generateImportKey(),
         ];
 
         $candidates = [];
@@ -368,7 +453,8 @@ class ProductImagesImportHelper
             return [];
         }
 
-        $keys = [];
+        $candidateLists = [];
+        $uniqueKeys = [];
         $out = [];
         foreach ($candidates as $i => $cand) {
             $raw = trim($cand['nameFromFile']);
@@ -376,38 +462,57 @@ class ProductImagesImportHelper
                 $out[$i] = 'Порожня назва файлу (без розширення)';
                 continue;
             }
-            $key = self::normalizeFilenameBase($raw, $filenameKeyRules);
-            if ($key === '') {
+            $keys = self::filenameKeyCandidates($raw, $filenameKeyRules);
+            if ($keys === []) {
                 $out[$i] = 'Після нормалізації назви файлу ключ порожній';
                 continue;
             }
-            $keys[$i] = $key;
+            $candidateLists[$i] = $keys;
+            foreach ($keys as $key) {
+                $uniqueKeys[$key] = true;
+            }
         }
 
-        if ($keys === []) {
+        if ($candidateLists === []) {
             return $out;
         }
 
-        $uniqueKeys = array_values(array_unique($keys));
+        // Одна вибірка на всі кандидати всіх файлів — запитів стільки ж, скільки й було.
+        $uniqueKeys = self::candidateKeysToStrings($uniqueKeys);
 
         if ($attachMode === self::ATTACH_FILENAME_SKU) {
-            return $out + $this->resolveBySkuBatch($keys, $uniqueKeys);
+            return $out + $this->resolveBySkuBatch($candidateLists, $uniqueKeys);
         }
 
         if ($attachMode === self::ATTACH_FILENAME_PRODUCT_ID) {
-            return $out + $this->resolveByProductIdBatch($keys, $uniqueKeys);
+            return $out + $this->resolveByProductIdBatch($candidateLists, $uniqueKeys);
         }
 
         return $out;
     }
 
     /**
-     * @param array<int, string> $keys       індекс кандидата → нормалізований SKU
-     * @param string[]           $uniqueKeys
+     * Текст для журналу: що саме шукали, коли товар не знайшовся.
+     *
+     * @param string[] $keys
+     */
+    private static function describeTriedKeys(array $keys): string
+    {
+        $head = array_shift($keys);
+        if ($keys === []) {
+            return (string) $head;
+        }
+
+        return $head . ' (пробували також: ' . implode(', ', $keys) . ')';
+    }
+
+    /**
+     * @param array<int, string[]> $candidateLists індекс файлу → ключі від найдовшого
+     * @param string[]             $uniqueKeys
      *
      * @return array<int, int|string>
      */
-    private function resolveBySkuBatch(array $keys, array $uniqueKeys): array
+    private function resolveBySkuBatch(array $candidateLists, array $uniqueKeys): array
     {
         $productIdBySku = [];
         $duplicateSkus = [];
@@ -427,13 +532,19 @@ class ProductImagesImportHelper
         }
 
         $out = [];
-        foreach ($keys as $i => $key) {
-            if (isset($duplicateSkus[$key])) {
-                $out[$i] = "Кілька варіантів з однаковим SKU: {$key}";
-            } elseif (isset($productIdBySku[$key])) {
-                $out[$i] = $productIdBySku[$key];
-            } else {
-                $out[$i] = "Варіант з SKU не знайдений: {$key}";
+        foreach ($candidateLists as $i => $keys) {
+            $out[$i] = 'Варіант з SKU не знайдений: ' . self::describeTriedKeys($keys);
+            foreach ($keys as $key) {
+                // Найдовший збіг виграє: `SS-203758-1` спершу пробує себе, потім
+                // `SS-203758` — і зупиняється там, не доходячи до огризка `SS`.
+                if (isset($duplicateSkus[$key])) {
+                    $out[$i] = "Кілька варіантів з однаковим SKU: {$key}";
+                    break;
+                }
+                if (isset($productIdBySku[$key])) {
+                    $out[$i] = $productIdBySku[$key];
+                    break;
+                }
             }
         }
 
@@ -441,12 +552,12 @@ class ProductImagesImportHelper
     }
 
     /**
-     * @param array<int, string> $keys
-     * @param string[]           $uniqueKeys
+     * @param array<int, string[]> $candidateLists індекс файлу → ключі від найдовшого
+     * @param string[]             $uniqueKeys
      *
      * @return array<int, int|string>
      */
-    private function resolveByProductIdBatch(array $keys, array $uniqueKeys): array
+    private function resolveByProductIdBatch(array $candidateLists, array $uniqueKeys): array
     {
         $numericKeys = [];
         $stringKeys = [];
@@ -484,13 +595,17 @@ class ProductImagesImportHelper
         }
 
         $out = [];
-        foreach ($keys as $i => $key) {
-            if (is_numeric($key) && isset($byId[(int) $key])) {
-                $out[$i] = (int) $key;
-            } elseif (isset($byExternalId[$key])) {
-                $out[$i] = $byExternalId[$key];
-            } else {
-                $out[$i] = "Товар не знайдений за ID/external_id: {$key}";
+        foreach ($candidateLists as $i => $keys) {
+            $out[$i] = 'Товар не знайдений за ID/external_id: ' . self::describeTriedKeys($keys);
+            foreach ($keys as $key) {
+                if (is_numeric($key) && isset($byId[(int) $key])) {
+                    $out[$i] = (int) $key;
+                    break;
+                }
+                if (isset($byExternalId[$key])) {
+                    $out[$i] = $byExternalId[$key];
+                    break;
+                }
             }
         }
 

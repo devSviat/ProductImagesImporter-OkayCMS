@@ -400,49 +400,108 @@
             progress.style.display = '';
             progress.value = 0;
 
-            var data = new FormData(form);
-            data.append('ajax', '1');
-            data.append('upload_images', '1');
+            // PHP приймає щонайбільше max_file_uploads файлів на запит (дефолт — 20)
+            // і відкидає решту мовчки, без помилки в $_FILES. Тому шлемо пачками:
+            // перша повертає import_key, під ним же лягають усі наступні.
+            var CHUNK_SIZE = 10;
+            var files = Array.prototype.slice.call(fileInput.files);
+            var chunks = [];
+            for (var i = 0; i < files.length; i += CHUNK_SIZE) {
+                chunks.push(files.slice(i, i + CHUNK_SIZE));
+            }
 
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', window.location.href, true);
-            xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+            var importKey = null;
+            var lastRedirectUrl = null;
 
-            xhr.upload.addEventListener('progress', function (evt) {
-                if (!evt.lengthComputable) {
+            function buildChunkData(chunk) {
+                var data = new FormData(form);
+                // Файли з форми беруться пачками вручну — прибираємо цілу вибірку.
+                data.delete('product_images[]');
+                for (var j = 0; j < chunk.length; j++) {
+                    data.append('product_images[]', chunk[j], chunk[j].name);
+                }
+                data.append('ajax', '1');
+                data.append('upload_images', '1');
+                if (importKey) {
+                    data.append('import_key', importKey);
+                }
+                return data;
+            }
+
+            function setProgress(chunkIndex, fraction) {
+                progress.value = Math.round(((chunkIndex + fraction) / chunks.length) * 100);
+            }
+
+            function fail(message) {
+                progress.style.display = 'none';
+                alert(message || 'Import request failed');
+            }
+
+            function finish() {
+                progress.value = 100;
+                if (lastRedirectUrl) {
+                    window.location.href = lastRedirectUrl;
+                } else {
+                    window.location.reload();
+                }
+            }
+
+            function sendChunk(index) {
+                if (index >= chunks.length) {
+                    finish();
                     return;
                 }
-                var percent = Math.round((evt.loaded / evt.total) * 90);
-                progress.value = percent;
-            });
 
-            xhr.onreadystatechange = function () {
-                if (xhr.readyState !== 4) {
-                    return;
-                }
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', window.location.href, true);
+                xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
 
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    progress.value = 100;
+                xhr.upload.addEventListener('progress', function (evt) {
+                    if (!evt.lengthComputable) {
+                        return;
+                    }
+                    setProgress(index, (evt.loaded / evt.total) * 0.9);
+                });
+
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState !== 4) {
+                        return;
+                    }
+
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        fail(xhr.responseText);
+                        return;
+                    }
+
                     var response = {};
                     try {
                         response = JSON.parse(xhr.responseText || '{}');
                     } catch (err) {
+                        // Пачка пройшла, але відповідь не JSON — далі слати нема куди.
                         window.location.reload();
                         return;
                     }
 
-                    if (response.redirect_url) {
-                        window.location.href = response.redirect_url;
-                    } else {
-                        window.location.reload();
+                    if (response.success === false) {
+                        fail(response.error);
+                        return;
                     }
-                } else {
-                    progress.style.display = 'none';
-                    alert(xhr.responseText || 'Import request failed');
-                }
-            };
 
-            xhr.send(data);
+                    if (response.import_key) {
+                        importKey = response.import_key;
+                    }
+                    if (response.redirect_url) {
+                        lastRedirectUrl = response.redirect_url;
+                    }
+
+                    setProgress(index, 1);
+                    sendChunk(index + 1);
+                };
+
+                xhr.send(buildChunkData(chunks[index]));
+            }
+
+            sendChunk(0);
         });
     }
 })();

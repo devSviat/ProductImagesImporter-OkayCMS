@@ -43,6 +43,7 @@ $lang['sviat__product_images_importer__files_formats'] = 'JPG, PNG, GIF, WebP or
 $lang['sviat__product_images_importer__files_choose'] = 'Choose files...';
 $lang['sviat__product_images_importer__files_attached_count'] = 'Files attached:';
 $lang['sviat__product_images_importer__files_required_error'] = 'Select at least one file for import.';
+$lang['sviat__product_images_importer__max_file_uploads_warning'] = 'The server accepted exactly %d files — that is the PHP max_file_uploads limit. The rest of the selection may have been dropped silently: check that every file is in the log.';
 $lang['sviat__product_images_importer__missing_product_policy_heading'] = 'If product is not found';
 $lang['sviat__product_images_importer__missing_product_policy_hint'] = 'Works only for "Each file by SKU" and "Each file by product ID" modes.';
 $lang['sviat__product_images_importer__missing_product_policy_save'] = 'Save file on the server';
