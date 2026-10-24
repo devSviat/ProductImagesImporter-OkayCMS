@@ -29,12 +29,12 @@ class ProductImagesImportHelper
     public const ON_MISSING_PRODUCT_SAVE = 'save';
     public const ON_MISSING_PRODUCT_SKIP = 'skip';
 
-    private const ALLOWED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+    private const array ALLOWED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
     private const MAX_FILE_SIZE = 10 * 1024 * 1024;
     private const MAX_ZIP_UNCOMPRESSED_SIZE = 100 * 1024 * 1024;
 
-    private const SOURCE_DIRECT = 'direct';
-    private const SOURCE_ZIP = 'zip';
+    private const string SOURCE_DIRECT = 'direct';
+    private const string SOURCE_ZIP = 'zip';
 
     private Config $config;
     private ProductsEntity $productsEntity;
@@ -239,7 +239,7 @@ class ProductImagesImportHelper
      */
     private static function candidateKeysToStrings(array $candidates): array
     {
-        return array_map('strval', array_keys($candidates));
+        return array_map(strval(...), array_keys($candidates));
     }
 
     private static function applyFilenameKeyRule(string $s, string $ruleId): string
@@ -392,7 +392,7 @@ class ProductImagesImportHelper
             }
 
             $entryName = $stat['name'];
-            if ($entryName === '' || substr($entryName, -1) === '/') {
+            if ($entryName === '' || str_ends_with($entryName, '/')) {
                 continue;
             }
 
@@ -405,7 +405,7 @@ class ProductImagesImportHelper
                 return;
             }
 
-            if (strpos($entryName, "\0") !== false || strpos($entryName, '..') !== false) {
+            if (str_contains($entryName, "\0") || str_contains($entryName, '..')) {
                 $result['errors'][] = 'Невалідний шлях до файлу: ' . basename($entryName);
                 continue;
             }
@@ -588,9 +588,7 @@ class ProductImagesImportHelper
                 ->noLimit()
                 ->find(['external_id' => $stringKeys]);
             foreach ($rows as $row) {
-                if (!isset($byExternalId[$row->external_id])) {
-                    $byExternalId[$row->external_id] = (int) $row->id;
-                }
+                $byExternalId[$row->external_id] ??= (int) $row->id;
             }
         }
 
