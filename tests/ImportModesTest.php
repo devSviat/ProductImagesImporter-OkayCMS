@@ -265,15 +265,15 @@ class ImportModesTest extends ImportFixture
         self::assertSame(['rejected', 'saved'], $this->operations());
     }
 
-    public function testBrokenZipIsLogged(): void
+    public function testCorruptZipIsLogged(): void
     {
-        $path = $this->root . 'broken.zip';
+        $path = $this->root . 'corrupt.zip';
         file_put_contents($path, 'not a zip');
 
-        $this->import([['name' => 'broken.zip', 'tmp_name' => $path, 'error' => UPLOAD_ERR_OK, 'size' => 9]], H::ATTACH_NONE, H::EXISTING_FILES_SKIP);
+        $this->import([['name' => 'corrupt.zip', 'tmp_name' => $path, 'error' => UPLOAD_ERR_OK, 'size' => 9]], H::ATTACH_NONE, H::EXISTING_FILES_SKIP);
 
         self::assertSame(['rejected'], $this->operations());
-        self::assertSame('broken.zip', $this->log[0]->filename);
+        self::assertSame('corrupt.zip', $this->log[0]->filename);
     }
 
     // --- назви файлів -------------------------------------------------------
