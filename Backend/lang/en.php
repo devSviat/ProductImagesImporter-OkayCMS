@@ -52,7 +52,7 @@ $lang['sviat__product_images_importer__missing_product_policy_skip'] = 'Skip fil
 $lang['sviat__product_images_importer__existing_files_heading'] = 'If a file with the same name already exists on the server';
 $lang['sviat__product_images_importer__existing_files_hint'] = 'Comparison is done by sanitized name (latin letters, digits, _ and -) in the originals folder. Default is to not overwrite existing files. "Unique name" adds a suffix with timestamp and random fragment. "Overwrite" replaces the existing file.';
 $lang['sviat__product_images_importer__existing_files_unique'] = 'Unique name';
-$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'Always generates a new name with suffix (time and random fragment); collisions with existing files are highly unlikely.';
+$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'A new name with a suffix (time and random fragment); existing files are left alone. If the product already has the same photo (identical content), no second copy is added.';
 $lang['sviat__product_images_importer__existing_files_skip'] = 'Skip';
 $lang['sviat__product_images_importer__existing_files_skip_hint'] = 'Default behavior. If sanitized_name.ext already exists in originals, the imported file is not saved.';
 $lang['sviat__product_images_importer__existing_files_overwrite'] = 'Overwrite';
@@ -82,6 +82,8 @@ $lang['sviat__product_images_importer__operation_attach_failed'] = 'Attach faile
 $lang['sviat__product_images_importer__operation_attach_skipped'] = 'Not attached';
 $lang['sviat__product_images_importer__operation_upload_failed'] = 'Upload error';
 $lang['sviat__product_images_importer__operation_skipped_missing_product'] = 'Skipped (product not found)';
+$lang['sviat__product_images_importer__operation_already_attached'] = 'Already attached to the product';
+$lang['sviat__product_images_importer__operation_rejected'] = 'Rejected';
 
 $lang['sviat__product_images_importer__alert_partial_title'] = 'Partial';
 $lang['sviat__product_images_importer__alert_partial_text'] = 'Files were saved, but some could not be attached to products:';
