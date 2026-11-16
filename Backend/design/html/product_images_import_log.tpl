@@ -123,12 +123,16 @@
                                             <span class="tag tag-warning fn_pii_tag">{$btr->sviat__product_images_importer__operation_skipped_existing|escape}</span>
                                         {elseif $log->operation == 'attached'}
                                             <span class="tag tag-success fn_pii_tag">{$btr->sviat__product_images_importer__operation_attached|escape}</span>
+                                        {elseif $log->operation == 'already_attached'}
+                                            <span class="tag tag-success fn_pii_tag">{$btr->sviat__product_images_importer__operation_already_attached|escape}</span>
                                         {elseif $log->operation == 'attach_failed'}
                                             <span class="tag tag-danger fn_pii_tag">{$btr->sviat__product_images_importer__operation_attach_failed|escape}</span>
                                         {elseif $log->operation == 'attach_skipped'}
                                             <span class="tag tag-warning fn_pii_tag">{$btr->sviat__product_images_importer__operation_attach_skipped|escape}</span>
                                         {elseif $log->operation == 'upload_failed'}
                                             <span class="tag tag-danger fn_pii_tag">{$btr->sviat__product_images_importer__operation_upload_failed|escape}</span>
+                                        {elseif $log->operation == 'rejected'}
+                                            <span class="tag tag-danger fn_pii_tag">{$btr->sviat__product_images_importer__operation_rejected|escape}</span>
                                         {elseif $log->operation == 'skipped_missing_product'}
                                             <span class="tag tag-warning fn_pii_tag">{$btr->sviat__product_images_importer__operation_skipped_missing_product|escape}</span>
                                         {else}

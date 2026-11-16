@@ -5,6 +5,7 @@ namespace Okay\Modules\Sviat\ProductImagesImporter\Backend\Helpers;
 use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Modules\Extender\ExtenderFacade;
+use Okay\Core\Translit;
 use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
@@ -292,23 +293,38 @@ class ProductImagesImportHelper
 
         $candidates = [];
         $openZips = [];
+        /** @var list<array{0: string, 1: string, 2: string}> $rejected [ім'я, status, повідомлення] */
+        $rejected = [];
 
         try {
             foreach ($files as $file) {
-                if (!is_array($file) || empty($file['tmp_name'])) {
+                if (!is_array($file) || !isset($file['name'])) {
                     continue;
                 }
-                $filename = basename($file['name']);
+                $filename = basename((string) $file['name']);
+                $uploadError = (int) ($file['error'] ?? UPLOAD_ERR_OK);
+                // Файл понад upload_max_filesize приходить без tmp_name: без цієї гілки
+                // він зникав з імпорту без жодного сліду в журналі.
+                if ($uploadError !== UPLOAD_ERR_OK || empty($file['tmp_name'])) {
+                    if ($uploadError !== UPLOAD_ERR_NO_FILE) {
+                        $rejected[] = [$filename, 'error', self::describeUploadError($uploadError)];
+                    }
+                    continue;
+                }
                 $fileExt = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 
                 if ($fileExt === 'zip') {
-                    $this->collectZipCandidates($file['tmp_name'], $candidates, $openZips, $result);
+                    $this->collectZipCandidates($file['tmp_name'], $filename, $candidates, $openZips, $rejected);
                 } elseif (in_array($fileExt, self::ALLOWED_EXTENSIONS, true)) {
-                    $this->collectDirectCandidate($file, $candidates, $result);
+                    $this->collectDirectCandidate($file, $candidates, $rejected);
                 } else {
-                    $result['errors'][] = "Невідомий формат файлу: {$filename}";
-                    $result['total']++;
+                    $rejected[] = [$filename, 'error', 'Невідомий формат файлу (дозволено JPG, PNG, GIF, WebP або ZIP)'];
                 }
+            }
+
+            foreach ($rejected as [$name, $status, $message]) {
+                $result[$status === 'error' ? 'errors' : 'warnings'][] = $name . ': ' . $message;
+                $this->logOutcome($result, $result['import_key'], $name, null, null, $status, 'rejected', $attachMode, $existingFilesPolicy, $message);
             }
 
             $productIdMap = $this->batchResolveProductIds(
@@ -328,10 +344,6 @@ class ProductImagesImportHelper
                 $result['import_key'],
                 $result
             );
-
-            if ($attachMode !== self::ATTACH_NONE) {
-                $this->backfillMainImageIds($productIdMap);
-            }
         } finally {
             foreach ($openZips as $zip) {
                 $zip->close();
@@ -341,21 +353,36 @@ class ProductImagesImportHelper
         return ExtenderFacade::execute(__METHOD__, $result, func_get_args());
     }
 
-    private function collectDirectCandidate(array $file, array &$candidates, array &$result): void
+    private static function describeUploadError(int $code): string
+    {
+        return match ($code) {
+            UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'Файл більший за ліміт сервера (upload_max_filesize), не завантажено',
+            UPLOAD_ERR_PARTIAL => 'Файл завантажився не повністю',
+            default => "Сервер не прийняв файл (код помилки {$code})",
+        };
+    }
+
+    protected function isUploadedFile(string $path): bool
+    {
+        return is_uploaded_file($path);
+    }
+
+    /**
+     * @param list<array{0: string, 1: string, 2: string}> $rejected
+     */
+    private function collectDirectCandidate(array $file, array &$candidates, array &$rejected): void
     {
         $filename = basename($file['name']);
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 
-        if (!is_uploaded_file($file['tmp_name'])) {
-            $result['errors'][] = "Невалідний файл: {$filename}";
-            $result['total']++;
+        if (!$this->isUploadedFile($file['tmp_name'])) {
+            $rejected[] = [$filename, 'error', 'Невалідний файл'];
 
             return;
         }
 
-        if ($file['size'] > self::MAX_FILE_SIZE) {
-            $result['errors'][] = "Файл занадто великий: {$filename} (макс. 10MB)";
-            $result['total']++;
+        if ((int) $file['size'] > self::MAX_FILE_SIZE) {
+            $rejected[] = [$filename, 'error', 'Файл занадто великий (макс. 10MB)'];
 
             return;
         }
@@ -370,14 +397,16 @@ class ProductImagesImportHelper
     }
 
     /**
-     * Зчитує маніфест ZIP без розпаковування на диск; реальний extract відкладений до commit-фази
-     * (stream напряму в originals/, без проміжного tempdir).
+     * Зчитує маніфест ZIP без розпаковування на диск; вміст читається лише в commit-фазі,
+     * по одному файлу.
+     *
+     * @param list<array{0: string, 1: string, 2: string}> $rejected
      */
-    private function collectZipCandidates(string $zipPath, array &$candidates, array &$openZips, array &$result): void
+    private function collectZipCandidates(string $zipPath, string $zipName, array &$candidates, array &$openZips, array &$rejected): void
     {
         $zip = new \ZipArchive();
         if ($zip->open($zipPath) !== true) {
-            $result['errors'][] = 'Помилка при відкритті ZIP архіву';
+            $rejected[] = [$zipName, 'error', 'Не вдалося відкрити ZIP-архів'];
 
             return;
         }
@@ -396,23 +425,37 @@ class ProductImagesImportHelper
                 continue;
             }
 
+            // Ім'я на диску береться лише з basename і проходить санітизацію,
+            // тож шлях усередині архіву вийти за межі originals не може.
+            $base = basename($entryName);
+            // `__MACOSX/._A.jpg` (AppleDouble від архіватора macOS) має ту саму назву й
+            // розширення, що й фото, і в режимі «Перезаписати» затирав би справжній файл.
+            if (str_starts_with($entryName, '__MACOSX/') || str_starts_with($base, '.')) {
+                continue;
+            }
+
             $size = isset($stat['size']) ? (int) $stat['size'] : 0;
             $uncompressedSize += $size;
             if ($uncompressedSize > self::MAX_ZIP_UNCOMPRESSED_SIZE) {
-                $result['errors'][] = 'ZIP архів занадто великий (макс. 100MB розпакованого розміру)';
+                $rejected[] = [$zipName, 'error', 'ZIP-архів занадто великий (макс. 100MB розпакованого розміру), архів пропущено'];
                 $zip->close();
 
                 return;
             }
 
-            if (str_contains($entryName, "\0") || str_contains($entryName, '..')) {
-                $result['errors'][] = 'Невалідний шлях до файлу: ' . basename($entryName);
+            if (str_contains($entryName, "\0")) {
+                $rejected[] = [$base, 'error', 'Невалідний шлях до файлу в ZIP'];
                 continue;
             }
 
-            $base = basename($entryName);
             $ext = strtolower(pathinfo($base, PATHINFO_EXTENSION));
             if (!in_array($ext, self::ALLOWED_EXTENSIONS, true)) {
+                $rejected[] = [$base, 'warning', 'Непідтримуваний формат у ZIP, файл пропущено'];
+                continue;
+            }
+
+            if ($size > self::MAX_FILE_SIZE) {
+                $rejected[] = [$base, 'error', 'Файл занадто великий (макс. 10MB)'];
                 continue;
             }
 
@@ -507,6 +550,15 @@ class ProductImagesImportHelper
     }
 
     /**
+     * MySQL порівнює sku/external_id без урахування регістру й хвостових пробілів
+     * і повертає значення з БД, а не те, що шукали. Мапа мусить зводити обидва боки однаково.
+     */
+    private static function lookupKey(string $value): string
+    {
+        return mb_strtolower(trim($value));
+    }
+
+    /**
      * @param array<int, string[]> $candidateLists індекс файлу → ключі від найдовшого
      * @param string[]             $uniqueKeys
      *
@@ -514,21 +566,22 @@ class ProductImagesImportHelper
      */
     private function resolveBySkuBatch(array $candidateLists, array $uniqueKeys): array
     {
-        $productIdBySku = [];
-        $duplicateSkus = [];
+        /** @var array<string, array<int, true>> $exact */
+        $exact = [];
+        /** @var array<string, array<int, true>> $loose */
+        $loose = [];
 
         $variants = $this->variantsEntity
             ->cols(['sku', 'product_id'])
             ->noLimit()
             ->find(['sku' => $uniqueKeys]);
 
+        // Множини товарів, а не перший-ліпший: кілька варіантів одного товару з тим
+        // самим SKU — не двозначність, фото однаково належить цьому товару.
         foreach ($variants as $v) {
-            $sku = $v->sku;
-            if (isset($productIdBySku[$sku])) {
-                $duplicateSkus[$sku] = true;
-            } else {
-                $productIdBySku[$sku] = (int) $v->product_id;
-            }
+            $productId = (int) $v->product_id;
+            $exact[trim((string) $v->sku)][$productId] = true;
+            $loose[self::lookupKey((string) $v->sku)][$productId] = true;
         }
 
         $out = [];
@@ -537,12 +590,14 @@ class ProductImagesImportHelper
             foreach ($keys as $key) {
                 // Найдовший збіг виграє: `AB-123456-1` спершу пробує себе, потім
                 // `AB-123456` — і зупиняється там, не доходячи до огризка `AB`.
-                if (isset($duplicateSkus[$key])) {
-                    $out[$i] = "Кілька варіантів з однаковим SKU: {$key}";
+                // Точний регістр важливіший: `ab-12` і `AB-12` можуть бути різними товарами.
+                $productIds = $exact[$key] ?? $loose[self::lookupKey($key)] ?? [];
+                if (count($productIds) > 1) {
+                    $out[$i] = "Кілька товарів з однаковим SKU: {$key}";
                     break;
                 }
-                if (isset($productIdBySku[$key])) {
-                    $out[$i] = $productIdBySku[$key];
+                if (count($productIds) === 1) {
+                    $out[$i] = (int) array_key_first($productIds);
                     break;
                 }
             }
@@ -562,7 +617,8 @@ class ProductImagesImportHelper
         $numericKeys = [];
         $stringKeys = [];
         foreach ($uniqueKeys as $k) {
-            if (is_numeric($k)) {
+            // is_numeric() пропускав `1e3` і `12.5`, а (int) робив з них 1000 і 12.
+            if (ctype_digit($k)) {
                 $numericKeys[(int) $k] = true;
             } else {
                 $stringKeys[] = $k;
@@ -582,13 +638,15 @@ class ProductImagesImportHelper
         }
 
         $byExternalId = [];
+        $byExternalIdLoose = [];
         if ($stringKeys !== []) {
             $rows = $this->productsEntity
                 ->cols(['id', 'external_id'])
                 ->noLimit()
                 ->find(['external_id' => $stringKeys]);
             foreach ($rows as $row) {
-                $byExternalId[$row->external_id] ??= (int) $row->id;
+                $byExternalId[trim((string) $row->external_id)] ??= (int) $row->id;
+                $byExternalIdLoose[self::lookupKey((string) $row->external_id)] ??= (int) $row->id;
             }
         }
 
@@ -596,12 +654,13 @@ class ProductImagesImportHelper
         foreach ($candidateLists as $i => $keys) {
             $out[$i] = 'Товар не знайдений за ID/external_id: ' . self::describeTriedKeys($keys);
             foreach ($keys as $key) {
-                if (is_numeric($key) && isset($byId[(int) $key])) {
+                if (ctype_digit($key) && isset($byId[(int) $key])) {
                     $out[$i] = (int) $key;
                     break;
                 }
-                if (isset($byExternalId[$key])) {
-                    $out[$i] = $byExternalId[$key];
+                $byExternal = $byExternalId[$key] ?? $byExternalIdLoose[self::lookupKey($key)] ?? null;
+                if ($byExternal !== null) {
+                    $out[$i] = $byExternal;
                     break;
                 }
             }
@@ -625,165 +684,298 @@ class ProductImagesImportHelper
         }
 
         $originalsDir = $this->config->root_dir . $this->config->original_images_dir;
+        $isFilenameAttachMode = in_array($attachMode, [self::ATTACH_FILENAME_SKU, self::ATTACH_FILENAME_PRODUCT_ID], true);
+
+        $productIds = [];
+        foreach ($productIdMap as $resolved) {
+            if (is_int($resolved)) {
+                $productIds[$resolved] = $resolved;
+            }
+        }
+        $productIds = array_values($productIds);
+        $attachedImages = $this->loadAttachedImages($productIds);
 
         foreach ($candidates as $i => $cand) {
             $resolved = $productIdMap[$i] ?? null;
-            $isFilenameAttachMode = in_array($attachMode, [self::ATTACH_FILENAME_SKU, self::ATTACH_FILENAME_PRODUCT_ID], true);
             if ($isFilenameAttachMode && $missingProductPolicy === self::ON_MISSING_PRODUCT_SKIP && !is_int($resolved)) {
                 $message = is_string($resolved) ? $resolved : 'Не вдалося знайти товар';
                 $result['warnings'][] = $cand['displayName'] . ': ' . $message . '. Файл пропущено';
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    null,
-                    null,
-                    'warning',
-                    'skipped_missing_product',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    $message . '. Файл пропущено'
-                );
-                $result['total']++;
+                $this->logOutcome($result, $importKey, $cand['displayName'], null, null, 'warning', 'skipped_missing_product', $attachMode, $existingFilesPolicy, $message . '. Файл пропущено');
                 continue;
             }
 
-            $sanitized = $this->sanitizeFilename($cand['nameFromFile']);
-            $sourceExists = is_file($originalsDir . $sanitized . '.' . $cand['ext']);
-            $stored = $this->resolveStorageFilename($sanitized, $cand['ext'], $existingFilesPolicy, $originalsDir);
+            $content = $this->readCandidate($cand, $openZips);
+            $invalidReason = $content === null ? 'Не вдалося прочитати файл' : self::describeInvalidImage($content);
+            if ($invalidReason !== null) {
+                $result['errors'][] = $cand['displayName'] . ': ' . $invalidReason;
+                $this->logOutcome($result, $importKey, $cand['displayName'], null, null, 'error', 'rejected', $attachMode, $existingFilesPolicy, $invalidReason);
+                continue;
+            }
+            $cand['content'] = $content;
+
+            $base = $this->sanitizeFilename($cand['nameFromFile']);
+            $stable = $base . '.' . $cand['ext'];
+            $stableOnDisk = is_file($originalsDir . $stable);
+            $productId = $isFilenameAttachMode && is_int($resolved) ? $resolved : null;
+
+            if ($productId !== null) {
+                $plan = $this->planReuseOfAttachedImage(
+                    $cand,
+                    $attachedImages[$productId] ?? [],
+                    $base,
+                    $stable,
+                    $stableOnDisk,
+                    $existingFilesPolicy,
+                    $originalsDir
+                );
+                if ($plan !== null && $plan['action'] === 'skip') {
+                    $message = 'Файл з такою назвою вже є на сервері, новий вміст не застосовано';
+                    $result['warnings'][] = $cand['displayName'] . ': ' . $message;
+                    $this->logOutcome($result, $importKey, $cand['displayName'], null, $productId, 'warning', 'skipped_existing', $attachMode, $existingFilesPolicy, $message);
+                    continue;
+                }
+                if ($plan !== null) {
+                    $reusedFilename = $plan['filename'];
+                    if ($plan['write'] && !$this->storeCandidate($cand, $originalsDir, $reusedFilename, $stableOnDisk)) {
+                        $result['errors'][] = "Помилка при завантаженні: {$cand['displayName']}";
+                        $this->logOutcome($result, $importKey, $cand['displayName'], $reusedFilename, $productId, 'error', 'upload_failed', $attachMode, $existingFilesPolicy, 'Помилка при завантаженні файлу');
+                        continue;
+                    }
+                    $suffix = '';
+                    if ($plan['repairFrom'] !== null) {
+                        $attachedImages[$productId] = $this->renameAttachedImage($attachedImages[$productId], $plan['repairFrom'], $reusedFilename);
+                        $suffix = " Назву в рядку виправлено: «{$plan['repairFrom']}» → «{$reusedFilename}»";
+                    }
+                    $prefix = match (true) {
+                        !$plan['write'] => 'Такий самий файл уже є на сервері. ',
+                        $stableOnDisk => 'Файл перезаписано. ',
+                        default => 'Файл збережено. ',
+                    };
+                    $result['success'][] = $reusedFilename;
+                    $result['processed']++;
+                    $this->logOutcome($result, $importKey, $cand['displayName'], $reusedFilename, $productId, 'success', 'already_attached', $attachMode, $existingFilesPolicy, $prefix . 'Фото вже прикріплено до товару, новий рядок не створено.' . $suffix);
+                    continue;
+                }
+            }
+
+            $stored = $this->resolveStorageFilename($base, $cand['ext'], $existingFilesPolicy, $originalsDir);
             if ($stored === null) {
                 $result['warnings'][] = $cand['displayName'] . ': файл уже є на сервері, пропущено';
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    null,
-                    null,
-                    'warning',
-                    'skipped_existing',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    'Файл уже є на сервері, пропущено'
-                );
-                $result['total']++;
+                $this->logOutcome($result, $importKey, $cand['displayName'], null, null, 'warning', 'skipped_existing', $attachMode, $existingFilesPolicy, 'Файл уже є на сервері, пропущено');
                 continue;
             }
 
-            $uploadPath = $originalsDir . $stored;
-            if ($existingFilesPolicy === self::EXISTING_FILES_OVERWRITE && is_file($uploadPath)) {
-                @unlink($uploadPath);
-            }
-
-            if (!$this->writeCandidate($cand, $uploadPath, $openZips)) {
+            $overwritten = $stored === $stable && $stableOnDisk;
+            if (!$this->storeCandidate($cand, $originalsDir, $stored, $overwritten)) {
                 $result['errors'][] = "Помилка при завантаженні: {$cand['displayName']}";
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    $stored,
-                    null,
-                    'error',
-                    'upload_failed',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    'Помилка при завантаженні файлу'
-                );
-                $result['total']++;
+                $this->logOutcome($result, $importKey, $cand['displayName'], $stored, null, 'error', 'upload_failed', $attachMode, $existingFilesPolicy, 'Помилка при завантаженні файлу');
                 continue;
             }
 
             $result['success'][] = $stored;
             $result['processed']++;
-            $result['total']++;
+            $savedPrefix = $overwritten ? 'Файл перезаписано' : 'Файл збережено';
 
             if ($attachMode === self::ATTACH_NONE) {
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    $stored,
-                    null,
-                    'success',
-                    $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE ? 'overwritten' : 'saved',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE
-                        ? 'Файл перезаписано на сервері'
-                        : 'Файл збережено'
-                );
+                $this->logOutcome($result, $importKey, $cand['displayName'], $stored, null, 'success', $overwritten ? 'overwritten' : 'saved', $attachMode, $existingFilesPolicy, $overwritten ? 'Файл перезаписано на сервері' : 'Файл збережено');
                 continue;
             }
 
-            if (is_int($resolved)) {
-                $insertResult = $this->insertImageRow($stored, $resolved, $cand['displayName'], $existingFilesPolicy);
-                if (!$insertResult['success']) {
-                    $result['warnings'][] = $cand['displayName'] . ': ' . $insertResult['error'];
-                    $this->addImportLogRow(
-                        $importKey,
-                        $cand['displayName'],
-                        $stored,
-                        $resolved,
-                        'warning',
-                        'attach_failed',
-                        $attachMode,
-                        $existingFilesPolicy,
-                        (
-                            $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE
-                                ? 'Файл перезаписано, але '
-                                : 'Файл збережено, але '
-                        ) . $insertResult['error']
-                    );
-                } else {
-                    $this->addImportLogRow(
-                        $importKey,
-                        $cand['displayName'],
-                        $stored,
-                        $resolved,
-                        'success',
-                        'attached',
-                        $attachMode,
-                        $existingFilesPolicy,
-                        $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE
-                            ? (
-                                !empty($insertResult['reused_existing_image'])
-                                    ? 'Файл перезаписано'
-                                    : 'Файл перезаписано та прикріплено до товару'
-                            )
-                            : 'Фото прикріплено до товару'
-                    );
+            if ($productId === null) {
+                $reason = is_string($resolved) ? $resolved : 'не вдалося прив’язати до товару';
+                $result['warnings'][] = $cand['displayName'] . ': ' . $reason;
+                $this->logOutcome($result, $importKey, $cand['displayName'], $stored, null, 'warning', 'attach_skipped', $attachMode, $existingFilesPolicy, $savedPrefix . ', ' . $reason);
+                continue;
+            }
+
+            $imageId = $this->insertImageRow($stored, $productId);
+            if ($imageId === null) {
+                $error = "Помилка при додаванні зображення ({$cand['displayName']})";
+                $result['warnings'][] = $cand['displayName'] . ': ' . $error;
+                $this->logOutcome($result, $importKey, $cand['displayName'], $stored, $productId, 'warning', 'attach_failed', $attachMode, $existingFilesPolicy, $savedPrefix . ', але ' . $error);
+                continue;
+            }
+
+            $attachedImages[$productId][$stored] = $imageId;
+            $this->logOutcome($result, $importKey, $cand['displayName'], $stored, $productId, 'success', 'attached', $attachMode, $existingFilesPolicy, $overwritten ? 'Файл перезаписано та прикріплено до товару' : 'Фото прикріплено до товару');
+        }
+
+        $this->backfillMainImageIds($productIds, $attachedImages);
+    }
+
+    /**
+     * Чи вже є в товару рядок images для цього файлу. CSV-імпорт товарів створює рядок
+     * за назвою з колонки images ще до того, як файл з'являється на диску, тож без цієї
+     * перевірки імпорт фото додавав другий рядок із тим самим іменем.
+     *
+     * Назви порівнюються байт у байт: колація MySQL нечутлива до регістру, а на диску
+     * `x1.jpg` і `X1.jpg` — різні файли.
+     *
+     * @param array<string, int> $attached filename → id рядка images цього товару
+     *
+     * @return array{action: 'reuse'|'skip', filename: string, write: bool, repairFrom: ?string}|null
+     *         reuse — лишити наявний рядок (write: чи писати файл; repairFrom: стара назва
+     *         в рядку, яку треба замінити на filename); skip — інший вміст під тією самою
+     *         назвою в режимі «Пропустити»; null — рядка нема, фото додається як нове
+     */
+    private function planReuseOfAttachedImage(
+        array $cand,
+        array $attached,
+        string $base,
+        string $stable,
+        bool $stableOnDisk,
+        string $policy,
+        string $originalsDir
+    ): ?array {
+        $hash = hash('sha256', $cand['content']);
+        $raw = $cand['displayName'];
+        $repairFrom = null;
+
+        // CSV пише назву як є (`ABC.JPG`, `AB 12.jpg`, `фото.jpg`), а файл ляже під
+        // санітизованою. Рядок без файлу лагодимо; рядок із живим файлом не чіпаємо.
+        if (!isset($attached[$stable]) && $raw !== $stable && isset($attached[$raw])) {
+            if (is_file($originalsDir . $raw)) {
+                if (hash_file('sha256', $originalsDir . $raw) === $hash) {
+                    return ['action' => 'reuse', 'filename' => $raw, 'write' => false, 'repairFrom' => null];
                 }
-            } elseif (is_string($resolved)) {
-                $result['warnings'][] = $cand['displayName'] . ': ' . $resolved;
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    $stored,
-                    null,
-                    'warning',
-                    'attach_skipped',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    (
-                        $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE
-                            ? 'Файл перезаписано, '
-                            : 'Файл збережено, '
-                    ) . $resolved
-                );
             } else {
-                $result['warnings'][] = $cand['displayName'] . ': не вдалося прив\'язати до товару';
-                $this->addImportLogRow(
-                    $importKey,
-                    $cand['displayName'],
-                    $stored,
-                    null,
-                    'warning',
-                    'attach_skipped',
-                    $attachMode,
-                    $existingFilesPolicy,
-                    (
-                        $sourceExists && $existingFilesPolicy === self::EXISTING_FILES_OVERWRITE
-                            ? 'Файл перезаписано, '
-                            : 'Файл збережено, '
-                    ) . 'не вдалося прив’язати до товару'
-                );
+                $repairFrom = $raw;
+                $attached[$stable] = $attached[$raw];
             }
         }
+
+        if (isset($attached[$stable])) {
+            if (!$stableOnDisk || $policy === self::EXISTING_FILES_OVERWRITE) {
+                return ['action' => 'reuse', 'filename' => $stable, 'write' => true, 'repairFrom' => $repairFrom];
+            }
+            if (hash_file('sha256', $originalsDir . $stable) === $hash) {
+                return ['action' => 'reuse', 'filename' => $stable, 'write' => false, 'repairFrom' => $repairFrom];
+            }
+            if ($policy === self::EXISTING_FILES_SKIP) {
+                return ['action' => 'skip', 'filename' => $stable, 'write' => false, 'repairFrom' => null];
+            }
+        }
+
+        if ($policy !== self::EXISTING_FILES_UNIQUE) {
+            return null;
+        }
+
+        // «Унікальне ім'я» щоразу дає нову назву, тож повторний імпорт того самого фото
+        // впізнається лише за вмістом серед уже прикріплених копій цього файлу.
+        $copyPattern = '/^' . preg_quote($base, '/') . '_\d+_[0-9a-f]{16}\.' . preg_quote($cand['ext'], '/') . '$/';
+        foreach (array_keys($attached) as $filename) {
+            $filename = (string) $filename;
+            if (preg_match($copyPattern, $filename) !== 1 || !is_file($originalsDir . $filename)) {
+                continue;
+            }
+            if (hash_file('sha256', $originalsDir . $filename) === $hash) {
+                return ['action' => 'reuse', 'filename' => $filename, 'write' => false, 'repairFrom' => null];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Порядок ключів зберігається: перший елемент — перше фото товару для main_image_id.
+     *
+     * @param array<string, int> $attached
+     *
+     * @return array<string, int>
+     */
+    private function renameAttachedImage(array $attached, string $from, string $to): array
+    {
+        $this->imagesEntity->update($attached[$from], ['filename' => $to]);
+
+        $out = [];
+        foreach ($attached as $filename => $id) {
+            $out[(string) $filename === $from ? $to : (string) $filename] = $id;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Читаємо щонайбільше MAX_FILE_SIZE + 1 байт: розмір у заголовку ZIP задає автор
+     * архіву, тож межу перевіряємо за фактично розпакованими даними.
+     */
+    private function readCandidate(array $cand, array $openZips): ?string
+    {
+        if ($cand['src'] === self::SOURCE_DIRECT) {
+            $content = @file_get_contents($cand['tmpPath'], false, null, 0, self::MAX_FILE_SIZE + 1);
+
+            return $content === false ? null : $content;
+        }
+
+        $zip = $openZips[$cand['zipPath']] ?? null;
+        $stream = $zip?->getStream($cand['entryName']);
+        if (!is_resource($stream)) {
+            return null;
+        }
+        $content = stream_get_contents($stream, self::MAX_FILE_SIZE + 1);
+        fclose($stream);
+
+        return $content === false ? null : $content;
+    }
+
+    /**
+     * Розширення каже лише, як файл назвали. Не-зображення в режимі «Перезаписати»
+     * знищило б справжнє фото, а нарізка на ньому однаково впала б.
+     */
+    private static function describeInvalidImage(string $content): ?string
+    {
+        if (strlen($content) > self::MAX_FILE_SIZE) {
+            return 'Файл занадто великий (макс. 10MB)';
+        }
+
+        $info = @getimagesizefromstring($content);
+        if ($info === false || !in_array($info[2], [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_GIF, IMAGETYPE_WEBP], true)) {
+            return 'Файл не є зображенням JPG, PNG, GIF або WebP';
+        }
+
+        return null;
+    }
+
+    /**
+     * Рядки images вибраних товарів одним запитом: filename → id у порядку position,
+     * тож перший елемент — перше фото товару.
+     *
+     * @param int[] $productIds
+     *
+     * @return array<int, array<string, int>>
+     */
+    private function loadAttachedImages(array $productIds): array
+    {
+        if ($productIds === []) {
+            return [];
+        }
+
+        $out = [];
+        $rows = $this->imagesEntity
+            ->cols(['id', 'product_id', 'filename', 'position'])
+            ->noLimit()
+            ->find(['product_id' => $productIds]);
+        foreach ($rows as $row) {
+            $out[(int) $row->product_id][(string) $row->filename] ??= (int) $row->id;
+        }
+
+        return $out;
+    }
+
+    private function logOutcome(
+        array &$result,
+        string $importKey,
+        string $filename,
+        ?string $storedFilename,
+        ?int $productId,
+        string $status,
+        string $operation,
+        string $attachMode,
+        string $existingFilesPolicy,
+        string $message
+    ): void {
+        $result['total']++;
+        $this->addImportLogRow($importKey, $filename, $storedFilename, $productId, $status, $operation, $attachMode, $existingFilesPolicy, $message);
     }
 
     private function addImportLogRow(
@@ -811,74 +1003,57 @@ class ProductImagesImportHelper
         $this->importLogEntity->add($row);
     }
 
-    /**
-     * Direct upload → move_uploaded_file (атомарний rename у межах ФС tmp/originals).
-     * ZIP entry → stream_copy_to_stream без проміжного tempdir.
-     */
-    private function writeCandidate(array $cand, string $uploadPath, array $openZips): bool
+    private function storeCandidate(array $cand, string $originalsDir, string $filename, bool $replacesExisting): bool
     {
-        if ($cand['src'] === self::SOURCE_DIRECT) {
-            return @move_uploaded_file($cand['tmpPath'], $uploadPath);
-        }
-
-        if ($cand['src'] !== self::SOURCE_ZIP) {
+        // Назва може прийти з images.filename (сирий CSV): на диск і в glob нарізок
+        // пускаємо лише санітизовану.
+        if (preg_match('/^[A-Za-z0-9_-]+\.(jpe?g|png|gif|webp)$/', $filename) !== 1) {
             return false;
         }
-
-        $zip = $openZips[$cand['zipPath']] ?? null;
-        if ($zip === null) {
-            return false;
-        }
-
-        $stream = $zip->getStream($cand['entryName']);
-        if (!is_resource($stream)) {
-            return false;
-        }
-
-        $out = @fopen($uploadPath, 'wb');
-        if (!is_resource($out)) {
-            fclose($stream);
+        $path = $originalsDir . $filename;
+        // Пишемо поруч і перейменовуємо: при збої запису старий файл лишається цілим.
+        $tmpPath = $path . '.part-' . bin2hex(random_bytes(4));
+        if (@file_put_contents($tmpPath, $cand['content']) === false || !@rename($tmpPath, $path)) {
+            @unlink($tmpPath);
 
             return false;
         }
-
-        $copied = stream_copy_to_stream($stream, $out);
-        fclose($stream);
-        fclose($out);
-
-        if ($copied === false) {
-            @unlink($uploadPath);
-
-            return false;
+        if ($replacesExisting) {
+            $this->deleteResizedCopies($filename);
         }
 
         return true;
     }
 
     /**
-     * @return array{success: bool, error?: string, reused_existing_image?: bool}
+     * Нарізки ріжуться на льоту лише тоді, коли їх нема на диску, тож після
+     * перезапису оригіналу сайт віддавав би старе фото. Маска та сама, що в ImagesEntity::delete().
      */
-    private function insertImageRow(
-        string $filename,
-        int $productId,
-        string $contextLabel,
-        string $existingFilesPolicy = self::EXISTING_FILES_SKIP
-    ): array
+    private function deleteResizedCopies(string $filename): void
     {
-        // Для режиму "перезаписати" не створюємо дубль у images, якщо цей файл уже прив'язаний до товару.
-        if ($existingFilesPolicy === self::EXISTING_FILES_OVERWRITE) {
-            $existingImage = $this->imagesEntity->findOne([
-                'product_id' => $productId,
-                'filename' => $filename,
-            ]);
-            if (!empty($existingImage->id)) {
-                return [
-                    'success' => true,
-                    'reused_existing_image' => true,
-                ];
-            }
+        $resizedDir = (string) $this->config->get('resized_images_dir');
+        if ($resizedDir === '') {
+            return;
         }
 
+        $file = pathinfo($filename, PATHINFO_FILENAME);
+        $ext = pathinfo($filename, PATHINFO_EXTENSION);
+        $prefix = $this->config->get('root_dir') . $resizedDir . $file;
+        // Маска з ImagesEntity::delete() ловить і `X.v2.100x100.jpg` — нарізку іншого
+        // оригіналу `X.v2.jpg`; регулярка відсіює все, крім формату Image::addResizeParams().
+        $own = '/^' . preg_quote($file, '/') . '\.\d*x\d*w?(\.[^.\/]+\.[^.\/]+)?\.' . preg_quote($ext, '/') . '(\.webp)?$/';
+        foreach (glob($prefix . '.*x*.' . $ext . '*') ?: [] as $resized) {
+            if (preg_match($own, basename($resized)) === 1) {
+                @unlink($resized);
+            }
+        }
+    }
+
+    /**
+     * @return int|null id нового рядка images; null — вставка не вдалась
+     */
+    private function insertImageRow(string $filename, int $productId): ?int
+    {
         $image = new \stdClass();
         $image->product_id = $productId;
         $image->filename = $filename;
@@ -886,58 +1061,33 @@ class ProductImagesImportHelper
 
         $imageId = $this->imagesEntity->add($image);
 
-        if ($imageId === false) {
-            return [
-                'success' => false,
-                'error' => "Помилка при додаванні зображення ({$contextLabel})",
-            ];
-        }
-
-        // Списки товарів (адмінка/каталог) беруть прев'ю з products.main_image_id.
-        // Якщо поле порожнє, проставляємо щойно імпортоване фото як головне.
-        $product = $this->productsEntity
-            ->cols(['id', 'main_image_id'])
-            ->findOne(['id' => $productId]);
-
-        if (!empty($product->id) && empty($product->main_image_id)) {
-            $this->productsEntity->update($productId, ['main_image_id' => (int) $imageId]);
-        }
-
-        return ['success' => true];
+        return $imageId === false ? null : (int) $imageId;
     }
 
     /**
-     * Для всіх успішно зарезолвених товарів гарантує main_image_id, якщо є хоча б одне фото.
+     * Списки товарів (адмінка/каталог) беруть прев'ю з products.main_image_id.
+     * Порожнє поле заповнюємо першим фото товару.
+     *
+     * @param int[]                          $productIds
+     * @param array<int, array<string, int>> $attachedImages
      */
-    private function backfillMainImageIds(array $productIdMap): void
+    private function backfillMainImageIds(array $productIds, array $attachedImages): void
     {
-        $productIds = [];
-        foreach ($productIdMap as $resolved) {
-            if (is_int($resolved)) {
-                $productIds[$resolved] = true;
-            }
-        }
-
         if ($productIds === []) {
             return;
         }
 
-        foreach (array_keys($productIds) as $productId) {
-            $product = $this->productsEntity
-                ->cols(['id', 'main_image_id'])
-                ->findOne(['id' => $productId]);
+        $products = $this->productsEntity
+            ->cols(['id', 'main_image_id'])
+            ->noLimit()
+            ->find(['id' => $productIds]);
 
-            if (empty($product->id) || !empty($product->main_image_id)) {
+        foreach ($products as $product) {
+            $productId = (int) $product->id;
+            if (!empty($product->main_image_id) || empty($attachedImages[$productId])) {
                 continue;
             }
-
-            $firstImage = $this->imagesEntity
-                ->cols(['id'])
-                ->findOne(['product_id' => $productId]);
-
-            if (!empty($firstImage->id)) {
-                $this->productsEntity->update($productId, ['main_image_id' => (int) $firstImage->id]);
-            }
+            $this->productsEntity->update($productId, ['main_image_id' => reset($attachedImages[$productId])]);
         }
     }
 
@@ -971,10 +1121,20 @@ class ProductImagesImportHelper
 
     private function sanitizeFilename(string $filename): string
     {
-        $filename = preg_replace('/[^a-z0-9_\-]/i', '_', $filename);
-        $filename = preg_replace('/_+/', '_', $filename);
+        $original = $filename;
+        // Без транслітерації кирилична назва ставала порожньою, і всі такі файли
+        // лягали в один `upload.jpg`. Регістр латиниці не чіпаємо: від нього залежать
+        // уже наявні імена в originals і рядки images.
+        if (preg_match('/[^\x00-\x7F]/', $filename) === 1) {
+            foreach (Translit::getTranslitPairs() as $pair) {
+                $filename = str_replace(explode('-', $pair['from']), explode('-', $pair['to']), $filename);
+            }
+        }
+        $filename = (string) preg_replace('/[^a-z0-9_\-]/i', '_', $filename);
+        $filename = (string) preg_replace('/_+/', '_', $filename);
+        $filename = trim($filename, '_');
 
-        return trim($filename, '_');
+        return $filename !== '' ? $filename : 'upload_' . substr(sha1($original), 0, 12);
     }
 
     private function generateUniqueFilename(string $baseName, string $extension): string

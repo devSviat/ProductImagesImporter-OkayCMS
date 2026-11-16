@@ -53,7 +53,7 @@ $lang['sviat__product_images_importer__missing_product_policy_skip'] = 'Проп
 $lang['sviat__product_images_importer__existing_files_heading'] = 'Якщо файл з такою назвою вже є на сервері';
 $lang['sviat__product_images_importer__existing_files_hint'] = 'Порівняння за ім’ям після санітизації (латиниця, цифри, _ та -) у теці з оригіналами. За замовчуванням — не перезаписувати наявні файли. «Унікальне ім’я» додає суфікс з часом і випадковим фрагментом. «Перезаписати» — замінити наявний файл.';
 $lang['sviat__product_images_importer__existing_files_unique'] = 'Унікальне ім’я';
-$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'Завжди нове ім’я з суфіксом (час і випадковий фрагмент); колізій з наявними файлами практично не буває.';
+$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'Нове ім’я з суфіксом (час і випадковий фрагмент), наявні файли не чіпаються. Якщо товар уже має таке саме фото (той самий вміст), друга копія не додається.';
 $lang['sviat__product_images_importer__existing_files_skip'] = 'Пропустити';
 $lang['sviat__product_images_importer__existing_files_skip_hint'] = 'За замовчуванням. Якщо sanitized_name.ext уже є в теці originals, файл з імпорту не зберігається.';
 $lang['sviat__product_images_importer__existing_files_overwrite'] = 'Перезаписати';
@@ -83,6 +83,8 @@ $lang['sviat__product_images_importer__operation_attach_failed'] = 'Не вда�
 $lang['sviat__product_images_importer__operation_attach_skipped'] = 'Не прикріплено';
 $lang['sviat__product_images_importer__operation_upload_failed'] = 'Помилка завантаження';
 $lang['sviat__product_images_importer__operation_skipped_missing_product'] = 'Пропущено (товар не знайдено)';
+$lang['sviat__product_images_importer__operation_already_attached'] = 'Вже прикріплено до товару';
+$lang['sviat__product_images_importer__operation_rejected'] = 'Відхилено';
 
 $lang['sviat__product_images_importer__alert_partial_title'] = 'Частково';
 $lang['sviat__product_images_importer__alert_partial_text'] = 'Файли збережено, але частину з них не вдалося прикріпити до товарів:';

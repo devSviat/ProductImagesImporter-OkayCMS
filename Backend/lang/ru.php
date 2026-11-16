@@ -52,7 +52,7 @@ $lang['sviat__product_images_importer__missing_product_policy_skip'] = 'Проп
 $lang['sviat__product_images_importer__existing_files_heading'] = 'Если файл с таким названием уже есть на сервере';
 $lang['sviat__product_images_importer__existing_files_hint'] = 'Сравнение по имени после санитизации (латиница, цифры, _ и -) в папке оригиналов. По умолчанию — не перезаписывать существующие файлы. «Уникальное имя» добавляет суффикс со временем и случайным фрагментом. «Перезаписать» — заменить существующий файл.';
 $lang['sviat__product_images_importer__existing_files_unique'] = 'Уникальное имя';
-$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'Всегда новое имя с суффиксом (время и случайный фрагмент); коллизий с существующими файлами практически не бывает.';
+$lang['sviat__product_images_importer__existing_files_unique_hint'] = 'Новое имя с суффиксом (время и случайный фрагмент), существующие файлы не трогаются. Если у товара уже есть такое же фото (тот же контент), вторая копия не добавляется.';
 $lang['sviat__product_images_importer__existing_files_skip'] = 'Пропустить';
 $lang['sviat__product_images_importer__existing_files_skip_hint'] = 'По умолчанию. Если sanitized_name.ext уже есть в папке originals, файл из импорта не сохраняется.';
 $lang['sviat__product_images_importer__existing_files_overwrite'] = 'Перезаписать';
@@ -82,6 +82,8 @@ $lang['sviat__product_images_importer__operation_attach_failed'] = 'Не уда�
 $lang['sviat__product_images_importer__operation_attach_skipped'] = 'Не прикреплено';
 $lang['sviat__product_images_importer__operation_upload_failed'] = 'Ошибка загрузки';
 $lang['sviat__product_images_importer__operation_skipped_missing_product'] = 'Пропущено (товар не найден)';
+$lang['sviat__product_images_importer__operation_already_attached'] = 'Уже прикреплено к товару';
+$lang['sviat__product_images_importer__operation_rejected'] = 'Отклонено';
 
 $lang['sviat__product_images_importer__alert_partial_title'] = 'Частично';
 $lang['sviat__product_images_importer__alert_partial_text'] = 'Файлы сохранены, но часть не удалось прикрепить к товару:';
